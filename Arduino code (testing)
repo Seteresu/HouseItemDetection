@@ -1,0 +1,193 @@
+#include <HouseholdItems_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
+
+/* Constant defines -------------------------------------------------------- */
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
+#define EI_CAMERA_FRAME_BYTE_SIZE                 3
+
+/* Private variables ------------------------------------------------------- */
+static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
+static bool is_initialised = false;
+uint8_t *snapshot_buf; // Points to the output of the capture
+
+/* Camera model - Define the ESP32-CAM model being used (AI Thinker is the most common) */
+#define CAMERA_MODEL_AI_THINKER // ESP32-CAM model (most common)
+
+#if defined(CAMERA_MODEL_AI_THINKER)
+  #define PWDN_GPIO_NUM    32
+  #define RESET_GPIO_NUM   -1
+  #define XCLK_GPIO_NUM    0
+  #define SIOD_GPIO_NUM    26
+  #define SIOC_GPIO_NUM    27
+
+  #define Y9_GPIO_NUM      35
+  #define Y8_GPIO_NUM      34
+  #define Y7_GPIO_NUM      39
+  #define Y6_GPIO_NUM      36
+  #define Y5_GPIO_NUM      21
+  #define Y4_GPIO_NUM      19
+  #define Y3_GPIO_NUM      18
+  #define Y2_GPIO_NUM      5
+  #define VSYNC_GPIO_NUM   25
+  #define HREF_GPIO_NUM    23
+  #define PCLK_GPIO_NUM    22
+#else
+  #error "Camera model not selected or unrecognized"
+#endif
+
+/* Camera configuration ---------------------------------------------------- */
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM,
+    .pin_sscb_scl = SIOC_GPIO_NUM,
+
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
+
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA,    // Frame size for processing (QQVGA-UXGA)
+    .jpeg_quality = 12, // Image quality, lower means better quality
+    .fb_count = 1,       // Use single frame buffer
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+/* Function declarations --------------------------------------------------- */
+bool ei_camera_init(void);
+void ei_camera_deinit(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+
+/**
+* @brief      Arduino setup function
+*/
+void setup() {
+    Serial.begin(115200);
+    while (!Serial);
+
+    Serial.println("Initializing camera...");
+    if (!ei_camera_init()) {
+        ei_printf("Failed to initialize Camera!\r\n");
+    } else {
+        ei_printf("Camera initialized\r\n");
+    }
+
+    delay(500);  // Add a small delay before starting inference
+}
+
+
+/**
+* @brief      Initialize the camera
+*/
+bool ei_camera_init(void) {
+    // Initialize the camera with the configuration
+    if (esp_camera_init(&camera_config) != ESP_OK) {
+        ei_printf("Camera init failed with error 0x%x\n", esp_camera_init(&camera_config));
+        return false;
+    }
+    return true;
+}
+void ei_camera_deinit(void) {
+    // Deinitialize the camera to free resources
+    esp_camera_deinit();
+    ei_printf("Camera deinitialized.\n");
+}
+
+/**
+* @brief      Capture an image from the camera
+*/
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ei_printf("Camera capture failed: %s\n", esp_err_to_name(esp_camera_fb_get()));
+        return false;
+    }
+
+    if (fb->width != img_width || fb->height != img_height) {
+        // Optionally resize the captured image here
+    }
+
+    memcpy(out_buf, fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+
+    return true;
+}
+
+
+/**
+* @brief      Function to get data from the camera for Edge Impulse classifier
+*/
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+    // Ensure the snapshot buffer is initialized
+    if (snapshot_buf == NULL) {
+        return -1;  // Error: snapshot buffer not available
+    }
+
+    size_t available_data = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT * 3;  // 3 bytes per pixel (RGB)
+    if (offset >= available_data) {
+        return -1;  // Error: offset exceeds data size
+    }
+
+    size_t read_length = (offset + length > available_data) ? available_data - offset : length;
+
+    // Copy the image data into the output pointer
+    memcpy(out_ptr, snapshot_buf + offset, read_length);
+
+    return read_length;
+}
+
+void loop() {
+    if (ei_sleep(5) != EI_IMPULSE_OK) return;
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ei_printf("Camera capture failed\n");
+        return;
+    }
+
+    uint8_t *snapshot_buf = fb->buf;
+
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
+
+    if (!ei_camera_capture(EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf)) {
+        ei_printf("Failed to capture image\r\n");
+        esp_camera_fb_return(fb);
+        return;
+    }
+
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+    if (err != EI_IMPULSE_OK) {
+        ei_printf("ERR: Failed to run classifier (%d)\n", err);
+        esp_camera_fb_return(fb);
+        return;
+    }
+
+    // Print the classification results
+    for (size_t ix = 0; ix < 3; ix++) {  // Adjust the number of classifications if necessary
+        ei_printf("Label: %s, Value: %.5f\n", result.classification[ix].label, result.classification[ix].value);
+    }
+
+    esp_camera_fb_return(fb);
+}
+
+
+
